@@ -1,4 +1,4 @@
-from pyscf import gto, scf, mcscf, fci, nac, csf_fci, ao2mo
+from pyscf import gto, scf, mcscf, fci, nac, csf_fci, ao2mo, grad
 from pyscf.tools import mo_mapping, molden
 from functools import reduce
 import scipy
@@ -26,32 +26,36 @@ class pre_BO(object):
         self.spin = spin # S
         ne_cas_sum = ne_cas[0] + ne_cas[1] # number of electrons
         self.ncsf = int((2*spin+1) / (no_cas+1) * math.comb(no_cas+1, int(ne_cas_sum/2-spin)) * math.comb(no_cas+1, int(ne_cas_sum/2+spin+1))) # number of CSFs
-        self.csf_coeff = np.zeros((self.ncsf), dtype=np.complex128) # time-dependent CSF coefficients
+        self.aoslices = self.mol.aoslice_by_atom() 
         
-        # AO properties
+        # AO integrals
         self.s_ao = self.mol.intor('int1e_ovlp') # AO overlap (nao, nao)
-        self.kin_e_ao = self.mol.intor('int1e_kin') # AO 1e kinetic energy integral
-        self.v_en_ao = self.mol.intor('int1e_nuc') # AO 1e e-n couloumb integral
-        self.v_ee_ao = self.mol.intor('int2e', aosym='s1') # AO 2e e-e coulomb integral
-        self.d_ao = -1.0 * mol.intor('int1e_ipovlp').transpose((0,2,1)) # (3, nao, nao)  <\chi_l | \nabla_e \chi_m> --> need to convert to d/dR_nuc which requires ao_slice for indices
-        self.dv_ee_ao = mol.intor('int2e_ip1') # (3, nao, nao, nao, nao) (\nabla k,l|m,n)  --> need to convert to d/dR_nuc
-        #self.dv_en_ao = ????
-        #self.dkin_e_ao = ????
+        self.kin_ao = self.mol.intor('int1e_kin') # AO 1e kinetic energy integral
+        self.nuc_ao = self.mol.intor('int1e_nuc') # AO 1e e-n couloumb integral
+        self.v_ao = self.mol.intor('int2e', aosym='s1').transpose(0, 2, 1, 3) # AO 2e e-e coulomb integral
+        
+        # AO integral gradients
+        self.d_ao = self.mol.intor('int1e_ipovlp').transpose((0,2,1)) # (3, nao, nao)  <\chi_l | \nabla_e \chi_m> --> need to convert to d/dR_nuc which requires ao_slice for indices
+        self.dkin_ao = np.zeros((3, self.norb, self.norb)) # gradient of AO 1e integral (3, nao, nao)
+        self.dnuc_ao = np.zeros((3, self.norb, self.norb)) # gradient of AO 1e integral (3, nao, nao)
+        self.dv_ao = np.zeros((3, self.norb, self.norb, self.norb, self.norb)) # gradient of AO 2e integral (3, nao, nao, nao, nao)
         
         # HF
         self.mf = scf.RHF(self.mol) # HF object
         #self.mf.run(conv_tol=1e-8)
         
-        # MO properties
+        # MO integrals
         #self.mo_coeff[:, :] = self.mf.mo_coeff[:, :] # (nao, nmo) In fact, nao=nmo. Just to clarify the row and column.
         self.mo_coeff = np.zeros((self.norb, self.norb)) # MO coefficient
         self.mo_coeff_old = np.zeros_like(self.mo_coeff) # backup MO coefficient
         self.grad_coeff = np.zeros((self.nat, 3, self.norb, self.norb)) # nuclear gradient of MO coefficient (nat, 3, nao, nmo)  
         self.h_mo = np.zeros((self.norb, self.norb)) # MO total 1e integral (kin + v_en) (nmo, nmo)
         self.v_mo = np.zeros((self.norb, self.norb, self.norb, self.norb)) # MO 2e integral  (nmo, nmo, nmo, nmo)
-        self.dh_mo = np.zeros((self.nat, 3, self.norb, self.norb)) # nuclear gradient of MO 1e integral (nat, 3, nmo, nmo)
-        self.dv_ee_mo = np.zeros((self.nat, 3, self.norb, self.norb)) # nuclear gradient of MO 2e integral (nat, 3, nmo, nmo)
+        
+        # MO integral gradients 
         self.d_mo = np.zeros((self.nat, 3, self.norb, self.norb)) # MO derivative coupling (nat, 3, nmo, nmo)
+        self.dh_mo = np.zeros((self.nat, 3, self.norb, self.norb)) # nuclear gradient of MO 1e integral (nat, 3, nmo, nmo)
+        self.dv_mo = np.zeros((self.nat, 3, self.norb, self.norb, self.norb, self.norb)) # nuclear gradient of MO 2e integral (nat, 3, nmo, nmo, nmo, nmo)
         self.g_mo = np.zeros((self.nat, self.norb, self.norb)) # MO scalar coupling (nat, nmo, nmo)
         self.d_dot_d_mo = np.zeros((self.nat, self.norb, self.norb, self.norb, self.norb)) # MO dd term (nat, 3, nmo, nmo)
         
@@ -61,23 +65,52 @@ class pre_BO(object):
         #self.mc.mo_coeff[:, :] = self.mo_coeff[:, :]
         self.mc.fcisolver.nroots = self.ncsf # number of states
         self.ncore = self.mc.ncore # number of core spatial orbital
-        self.e_core = 0. # core energy + Vnn
         self.h_cas = np.zeros((self.no_cas, self.no_cas)) # 1e active
         self.v_cas = np.zeros((self.no_cas, self.no_cas)) # TODO 2e active, wrong dimension..!!!!!! It will be overwritten but.. need to be fixed. I think it was no_cas*(no_cas+1)/2 , no_cas*(no_cas+1)/2.. double check
         
         # CSF properties
+        self.V_core = 0. # core energy + Vnn
         self.V_csf = np.zeros((self.ncsf, self.ncsf)) # H_BO CSF matrix 
+        self.dV_core = np.zeros((self.nat, 3))
         self.dV_csf = np.zeros((self.nat, 3, self.ncsf, self.ncsf)) # nuclear gradient of H_BO CSF matrix
         self.D_csf = np.zeros((self.nat, 3, self.ncsf, self.ncsf)) # derivative coupling between CSFs
+
+        # Dynamics variables
+        self.csf_coeff = np.zeros((self.ncsf), dtype=np.complex128) # time-dependent CSF coefficients
+        self.force = np.zeros((self.nat, 3))
 
     def get_csf(self):
         pass
 
     def get_V_csf(self):
         
-        self.h_cas, self.e_core = self.mc.get_h1cas() # get active 1e integral and core energy + Vnn
+        # TODO: make our own version of get_h1cas/_h2cas to use self.h_ao and self_v_ao, mc.get_h1cas/_h2cas calculates AO integrals again..
+        self.h_cas, self.V_core = self.mc.get_h1cas() # get active 1e integral and core energy + Vnn
         self.v_cas = self.mc.get_h2cas() # get active 2e integral
         self.V_csf = self.mc.fcisolver.pspace(self.h_cas, self.v_cas, self.no_cas, self.ne_cas)[1] # get CSF Hamiltonian matrix
+        #print(self.h_cas)
+        #print(self.V_core)
+        #print(self.v_cas)
+    
+    def get_V_csf_2(self):
+        
+        o0 = self.ncore
+        o1 = self.ncore + self.no_cas
+        
+        self.h_cas  = np.einsum('kp,kl,lq -> pq', self.mo_coeff[:, o0:o1], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, o0:o1], optimize=True)
+        self.h_cas += 2.0 * np.einsum('kp, la, mq, na, klmn -> pq', self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+        self.h_cas -= np.einsum('kp, lq, ma, na, klmn -> pq', self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+
+        self.v_cas = np.einsum('kp, lq, mr, ns, klmn -> pqrs', self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+        self.v_cas = ao2mo.restore('4', self.v_cas.transpose(0, 2, 1, 3), self.no_cas)
+
+        self.V_core = self.mc.energy_nuc()
+        self.V_core += 2.0 * np.einsum('ka,kl,la -> ', self.mo_coeff[:, :o0], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, :o0], optimize=True)
+        self.V_core += 2.0 * np.einsum('ka, lb, ma, nb, klmn -> ', self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+        self.V_core -= np.einsum('ka, la, mb, nb, klmn -> ', self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+        #print(self.h_cas)
+        #print(self.V_core)
+        #print(self.v_cas)
     
     def get_D_csf(self):
         
@@ -94,11 +127,111 @@ class pre_BO(object):
         pass
 
     def get_dV_csf(self):
-        pass
+        
+        # nuclear gradients
+        self.dV_core = grad.rhf.grad_nuc(self.mol)
+
+        # electronic gradients
+        self.get_grad_ao()
+        
+        s_inv = scipy.linalg.inv(self.s_ao)
+        # TODO: active space 
+        o0 = self.ncore
+        o1 = self.ncore + self.no_cas
+        for iat in range(self.nat):
+            shl0, shl1, p0, p1 = self.aoslices[iat]
+            self.grad_coeff[iat, :, :, :] = - 0.5 * np.einsum('kl, clm, mp -> ckp', s_inv[:, :], -self.d_ao[:, :, p0:p1], self.mo_coeff[p0:p1, :], optimize=True)
+            self.grad_coeff[iat, :, :, :] += - 0.5 * np.einsum('kl, cml, mp -> ckp', s_inv[:, p0:p1], -self.d_ao[:, :, p0:p1], self.mo_coeff[:, :], optimize=True)
+            
+            # 1e
+            # \nabla C terms
+            dh_tmp  = np.einsum('ckp,kl,lq -> cpq', self.grad_coeff[iat, :, :, o0:o1], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, o0:o1], optimize=True)
+            # AO <\nabla | h | >  terms
+            dh_tmp += np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[p0:p1, o0:o1], -(self.dkin_ao+self.dnuc_ao)[:, p0:p1, :], self.mo_coeff[:, o0:o1], optimize=True)
+            # AO < |\nabla V_nuc | > terms
+            with self.mol.with_rinv_at_nucleus(iat):
+                drinv_tmp = self.mol.intor('int1e_iprinv', comp=3)
+                drinv_tmp *= -self.mol.atom_charge(iat)
+            dh_tmp += np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[:, o0:o1], drinv_tmp[:, :, :], self.mo_coeff[:, o0:o1], optimize=True)
+            # effective 1e from 2e
+            # core coulomb
+            dh_tmp += 2.0 * np.einsum('ckp, la, mq, na, klmn -> cpq', self.grad_coeff[iat, :, :, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+            dh_tmp += 2.0 * np.einsum('cka, lp, ma, nq, klmn -> cpq', self.grad_coeff[iat, :, :, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+            dh_tmp += 2.0 * np.einsum('kp, la, mq, na, cklmn -> cpq', self.mo_coeff[p0:p1, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            dh_tmp += 2.0 * np.einsum('ka, lp, ma, nq, cklmn -> cpq', self.mo_coeff[p0:p1, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            # core exchange
+            dh_tmp -= np.einsum('ckp, lq, ma, na, klmn -> cpq', self.grad_coeff[iat, :, :, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+            dh_tmp -= np.einsum('cka, la, mp, nq, klmn -> cpq', self.grad_coeff[iat, :, :, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+            dh_tmp -= np.einsum('kp, lq, ma, na, cklmn -> cpq', self.mo_coeff[p0:p1, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            dh_tmp -= np.einsum('ka, la, mp, nq, cklmn -> cpq', self.mo_coeff[p0:p1, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            ## active exchange
+            #dh_tmp -= 0.5 * np.einsum('ckp, lq, mr, nr, klmn -> cpq', self.grad_coeff[iat, :, :, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+            #dh_tmp -= 0.5 * np.einsum('ckr, lr, mp, nq, klmn -> cpq', self.grad_coeff[iat, :, :, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+            #dh_tmp -= 0.5 * np.einsum('kp, lq, mr, nr, cklmn -> cpq', self.mo_coeff[p0:p1, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            #dh_tmp -= 0.5 * np.einsum('kr, lr, mp, nq, cklmn -> cpq', self.mo_coeff[p0:p1, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            # total
+            dh_mo = dh_tmp + dh_tmp.transpose(0, 2, 1)
+
+            # 2e
+            # \nabla C terms
+            dv_tmp  = np.einsum('ckp, lq, mr, ns, klmn -> cpqrs', self.grad_coeff[iat, :, :, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+            # AO <\nabla, | , > terms
+            dv_tmp += np.einsum('kp, lq, mr, ns, cklmn -> cpqrs', self.mo_coeff[p0:p1, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            # Total
+            dv_mo = dv_tmp + dv_tmp.transpose(0, 2, 1, 4, 3) + dv_tmp.transpose(0, 3, 4, 1, 2) + dv_tmp.transpose(0, 4, 3, 2, 1)
+            
+            # effective const from 1e
+            self.dV_core[iat, :] += 4.0 * np.einsum('cka,kl,la -> c', self.grad_coeff[iat, :, :, :o0], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, :o0], optimize=True)
+            self.dV_core[iat, :] += 4.0 * np.einsum('ka, ckl, la -> c', self.mo_coeff[p0:p1, :o0], -(self.dkin_ao+self.dnuc_ao)[:, p0:p1, :], self.mo_coeff[:, :o0], optimize=True)
+            self.dV_core[iat, :] += 4.0 * np.einsum('ka, ckl, la -> c', self.mo_coeff[:, :o0], drinv_tmp[:, :, :], self.mo_coeff[:, :o0], optimize=True)
+
+            # effective const from 2e
+            # coulomb
+            self.dV_core[iat, :] += 8.0 * np.einsum('cka, lb, ma, nb, klmn -> c', self.grad_coeff[iat, :, :, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+            self.dV_core[iat, :] += 8.0 * np.einsum('ka, lb, ma, nb, cklmn -> c', self.mo_coeff[p0:p1, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            # exchange
+            self.dV_core[iat, :] -= 4.0 * np.einsum('cka, la, mb, nb, klmn -> c', self.grad_coeff[iat, :, :, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+            self.dV_core[iat, :] -= 4.0 * np.einsum('ka, la, mb, nb, cklmn -> c', self.mo_coeff[p0:p1, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], -self.dv_ao[:, p0:p1, :, :, :], optimize=True)
+            
+            for isp in range(3):
+                self.dV_csf[iat, isp, :, :] = self.mc.fcisolver.pspace(dh_mo[isp, :, :], dv_mo.transpose(0,1,3,2,4)[isp, :, :, :, :], self.no_cas, self.ne_cas)[1] # get CSF Hamiltonian matrix
+                
+                #dv_mo_tmp = ao2mo.restore('4', dv_mo[isp].transpose(0, 2, 1, 3), self.no_cas)
+                #self.dV_csf[iat, isp, :, :] = self.mc.fcisolver.pspace(dh_mo[isp, :, :], dv_mo_tmp, self.no_cas, self.ne_cas)[1] # get CSF Hamiltonian matrix
+                
+    
+    def get_dV_csf_2(self):
+        
+        # nuclear gradients
+        self.dV_core = grad.rhf.grad_nuc(self.mol)
+
+        # electronic gradients
+        self.get_grad_ao()
+        
+        s_inv = scipy.linalg.inv(self.s_ao)
+        # TODO: active space 
+        o0 = self.ncore
+        o1 = self.ncore + self.no_cas
+        zero_v = np.zeros((self.no_cas, self.no_cas, self.no_cas, self.no_cas))
+        for iat in range(self.nat):
+            shl0, shl1, p0, p1 = self.aoslices[iat]
+            with self.mol.with_rinv_at_nucleus(iat):
+                drinv_tmp = self.mol.intor('int1e_iprinv', comp=3)
+                drinv_tmp *= -self.mol.atom_charge(iat)
+            dh_tmp = np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[:, o0:o1], drinv_tmp[:, :, :], self.mo_coeff[:, o0:o1], optimize=True)
+            dh_mo = dh_tmp + dh_tmp.transpose(0, 2, 1)
+            self.dV_core[iat, :] += 4.0 * np.einsum('ka, ckl, la -> c', self.mo_coeff[:, :o0], drinv_tmp[:, :, :], self.mo_coeff[:, :o0], optimize=True)
+            
+            for isp in range(3):
+                self.dV_csf[iat, isp, :, :] = self.mc.fcisolver.pspace(dh_mo[isp, :, :], zero_v, self.no_cas, self.ne_cas)[1] # get CSF Hamiltonian matrix
+        
+
 
     def calculate_force(self):
-        pass
-    
+        self.force = -np.einsum('I, AcIJ, J -> Ac', self.csf_coeff.conj(), self.dV_csf, self.csf_coeff).real
+        #self.force -= -2.0 * np.einsum('I, AcKI, KJ, J -> Ac', self.csf_coeff.conj(), self.D_csf, self.V_csf, self.csf_coeff).real
+        self.force -= self.dV_core
+
     def get_int_mo(self):
         
         C = self.mo_coeff
@@ -107,7 +240,7 @@ class pre_BO(object):
         # Duplicative, since get_h1cas and get_h2cas calculate these.
 
         # 1e
-        #self.h_mo = np.einsum('kl,kp,lq->pq', (self.v_en_ao + self.kin_e_ao), C, C)
+        #self.h_mo = np.einsum('kl,kp,lq->pq', (self.nuc_ao + self.kin_ao), C, C)
         # 2e
         #self.v_mo = ao2mo.full(self.v_ee_ao, C)
         
@@ -117,26 +250,21 @@ class pre_BO(object):
         dS_tmp = np.zeros((3, self.norb, self.norb)) # \nabla_\nu S 
         d2S_tmp = np.zeros((self.norb, self.norb)) # \nabla_\nu^2 S
 
-        S_inv = scipy.linalg.inv(self.s_ao)
-        ao_slice = self.mol.aoslice_by_atom()[:, 2:4] # start-AO-id and stop-AO-id for each atom. (0,1 entries are start/stop-"shell"-ids)
-        
         # d
         for iat in range(self.nat):
-            start, stop = ao_slice[iat, 0], ao_slice[iat, 1]
-            self.d_mo[iat, :, :, :] = 0.5 * np.einsum('kp,akl,lq->apq' ,\
-                self.mo_coeff[:, :],\
-                self.d_ao[:, :, start:stop],\
-                self.mo_coeff[start:stop, :])
-        self.d_mo = self.d_mo - self.d_mo.transpose((0, 1, 3, 2))
+            shl0, shl1, p0, p1 = self.aoslices[iat]
+            self.d_mo[iat, :, :, :]  = 0.5 * np.einsum('kp,akl,lq->apq', self.mo_coeff[:, :], -self.d_ao[:, :, p0:p1], self.mo_coeff[p0:p1, :], optimize=True)
+            self.d_mo[iat, :, :, :] -= 0.5 * np.einsum('kp,alk,lq->apq', self.mo_coeff[p0:p1, :], -self.d_ao[:, :, p0:p1], self.mo_coeff[:, :], optimize=True)
         
         # g    
+        #S_inv = scipy.linalg.inv(self.s_ao)
         #self.d_dot_d_mo[:, :, :, :, :] = np.einsum('acpr,acqs->aprqs', self.d_mo, self.d_mo) # pyscf follows chemist's notation
         #tmp_dense = np.zeros((self.norb, self.norb))
         #for iat in range(self.nat):
         #    start, stop = ao_slice[iat, 0], ao_slice[iat, 1]
         #    
         #    tmp_dense[:, :] = 0.
-        #    tmp_dense[:, start:stop] = (-2.0 * self.kin_e_ao[:, start:stop]) # g_ao
+        #    tmp_dense[:, start:stop] = (-2.0 * self.kin_ao[:, start:stop]) # g_ao
         #    
         #    d2S_tmp[:, :] = 0.
         #    d2S_tmp[:, start:stop] = (-2.0 * self.kin_e_ao[:, start:stop]) 
@@ -144,10 +272,10 @@ class pre_BO(object):
         #    d2S_tmp[start:stop, start:stop] = 0.0 # already zero but for stability
         #    tmp_dense += -0.5 * d2S_tmp # \nabla^2 S
 
-        #    tmp_dense[:, :] -= 0.25 * np.einsum('ckl,lm,cnm->kn', self.d_ao[:, :, start:stop], S_inv[start:stop, start:stop], self.d_ao[:, :, start:stop])
-        #    tmp_dense[:, start:stop] -= 0.25 * np.einsum('ckl,lm,cmn->kn', self.d_ao[:, :, start:stop], S_inv[start:stop, :], self.d_ao[:, :, start:stop])
-        #    tmp_dense[start:stop, :] += 0.75 * np.einsum('clk,lm,cnm->kn', self.d_ao[:, :, start:stop], S_inv[:, start:stop], self.d_ao[:, :, start:stop])
-        #    tmp_dense[start:stop, start:stop] += 0.75 * np.einsum('clk,lm,cmn->kn', self.d_ao[:, :, start:stop], S_inv[:, :], self.d_ao[:, :, start:stop])
+        #    tmp_dense[:, :] -= 0.25 * np.einsum('ckl,lm,cnm->kn', -self.d_ao[:, :, start:stop], S_inv[start:stop, start:stop], -self.d_ao[:, :, start:stop])
+        #    tmp_dense[:, start:stop] -= 0.25 * np.einsum('ckl,lm,cmn->kn', -self.d_ao[:, :, start:stop], S_inv[start:stop, :], -self.d_ao[:, :, start:stop])
+        #    tmp_dense[start:stop, :] += 0.75 * np.einsum('clk,lm,cnm->kn', -self.d_ao[:, :, start:stop], S_inv[:, start:stop], -self.d_ao[:, :, start:stop])
+        #    tmp_dense[start:stop, start:stop] += 0.75 * np.einsum('clk,lm,cmn->kn', -self.d_ao[:, :, start:stop], S_inv[:, :], -self.d_ao[:, :, start:stop])
 
         #    #g_mo_test[iat, :, :] = np.einsum('kp,kl,lq->pq', C, tmp_dense, C)
         #    self.g_mo[iat, :, :] = np.einsum('kp,kl,lq->pq', C, tmp_dense, C)
@@ -169,7 +297,6 @@ class pre_BO(object):
         mo = self.mo_coeff @ U.T
         self.mo_coeff = np.copy(mo)
 
-
     def align_mo_coeff_simple(self, mol_old, mo_old):
         
         mo = np.copy(self.mo_coeff)
@@ -187,17 +314,56 @@ class pre_BO(object):
 
         self.mo_coeff = mo[:, col_ind] * phases # bring new MO to i-th column (bring new index --> old index)
 
+    def align_mo_coeff_lowdin(self, mol_old, mo_old):
+        """
+        Update self.mo_coeff using Lowdin propagation (symmetric orthonormalization).
+        C_new = C_old * (C_old.T * S_new * C_old)^-1/2
+        This is the orbital update model assumed by the analytical gradient formulas.
+        """
+        s_new = self.mol.intor('int1e_ovlp')
+        tmp = mo_old.T @ s_new @ mo_old
+        val, vec = scipy.linalg.eigh(tmp)
+        tmp_inv_sqrt = vec @ np.diag(1.0/np.sqrt(val)) @ vec.T
+        self.mo_coeff = mo_old @ tmp_inv_sqrt
+
     def get_int_ao(self):
 
         self.s_ao = self.mol.intor('int1e_ovlp') # AO overlap (nao, nao)
-        self.kin_e_ao = self.mol.intor('int1e_kin') # AO 1e kinetic energy integral
-        self.v_en_ao = self.mol.intor('int1e_nuc') # AO 1e e-n couloumb integral
-        self.v_ee_ao = self.mol.intor('int2e', aosym='s1') # AO 2e e-e coulomb integral
-        self.d_ao = -1.0 * mol.intor('int1e_ipovlp').transpose((0,2,1)) # (3, nao, nao)  <\chi_l | \nabla_e \chi_m> --> need to convert to d/dR_nuc which requires ao_slice for indices
-        self.dv_ee_ao = mol.intor('int2e_ip1') # (3, nao, nao, nao, nao) (\nabla k,l|m,n)  --> need to convert to d/dR_nuc
-        #self.dv_en_ao = ????
-        #self.dkin_e_ao = ????
+        self.kin_ao = self.mol.intor('int1e_kin') # AO 1e kinetic energy integral
+        self.nuc_ao = self.mol.intor('int1e_nuc') # AO 1e e-n couloumb integral
+        self.v_ao = self.mol.intor('int2e', aosym='s1').transpose(0, 2, 1, 3) # AO 2e e-e coulomb integral
+        self.d_ao = self.mol.intor('int1e_ipovlp').transpose((0,2,1)) # (3, nao, nao)  <\chi_l | \nabla_e \chi_m> --> need to convert to d/dR_nuc which requires ao_slice for indices
+    
+    def get_grad_ao(self):
+        
+        self.dkin_ao = self.mol.intor('int1e_ipkin')
+        self.dnuc_ao = self.mol.intor('int1e_ipnuc')
+        self.dv_ao = self.mol.intor('int2e_ip1').transpose(0, 1, 3, 2, 4)
    
+    #def get_grad_mo(self, iat):
+    #    
+    #    s_inv = scipy.linalg.inv(self.s_ao)
+    #    for iat in range(self.nat):
+    #        shl0, shl1, p0, p1 = self.aoslices[iat]
+    #        self.grad_coeff[iat, :, :, :] = - 0.5 * np.einsum('kl, clm, mp -> ckp', s_inv[:, :], self.d_ao[:, :, p0:p1], self.mo_coeff[p0:p1, :], optimize=True)
+    #        self.grad_coeff[iat, :, :, :] += - 0.5 * np.einsum('kl, cml, mp -> ckp', s_inv[:, p0:p1], self.d_ao[:, :, p0:p1], self.mo_coeff[:, :], optimize=True)
+    #        # \nabla C terms
+    #        self.dh_mo[iat, :, :, :] = np.einsum('ckp,kl,lq', self.grad_coeff[iat, :, :, :], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, :])
+    #        self.dh_mo[iat, :, :, :] -= np.einsum('kp,kl,clq', self.mo_coeff[:, :], (self.kin_ao+self.nuc_ao)[:, :], self.grad_coeff[iat, :, :, :])
+    #        # AO <\nabla | h | >  terms
+    #        self.dh_mo[iat, :, :, :] -= np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[p0:p1, :], (self.dkin_ao+self.dnuc_ao)[:, p0:p1, :], self.mo_coeff[:, :], optimize=True)
+    #        self.dh_mo[iat, :, :, :] -= np.einsum('kp, clk, lq -> cpq', self.mo_coeff[:, :], (self.dkin_ao+self.dnuc_ao)[:, p0:p1, :], self.mo_coeff[p0:p1, :], optimize=True)
+    #        # AO < |\nabla V_nuc | > terms
+    #        with self.mol.with_rinv_at_nucleus(iat):
+    #            drinv_tmp = self.mol.intor('int1e_iprinv', comp=3)
+    #            drinv_tmp *= -self.mol.atom_charge(iat)
+    #        self.dh_mo[iat, :, :, :] -= np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[p0:p1, :], drinv_tmp[:, p0:p1, :], self.mo_coeff[:, :], optimize=True)
+    #        self.dh_mo[iat, :, :, :] -= np.einsum('kp, clk, lq -> cpq', self.mo_coeff[:, :], drinv_tmp[:, p0:p1, :], self.mo_coeff[p0:p1, :], optimize=True)
+
+    #        self.dv_mo[iat, :, :, :, :, :]  = np.einsum('ckp, lq, mr, ns, klmn -> cpqrs', self.grad_coeff[iat, :, :, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.v_ao[:, :, :, :], optimize=True)
+    #        self.dv_mo[iat, :, :, :, :, :] += np.einsum('clq, kp, mr, ns, klmn -> cpqrs', self.grad_coeff[iat, :, :, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.v_ao[:, :, :, :], optimize=True)
+    #        self.dv_mo[iat, :, :, :, :, :] += np.einsum('cmr, lq, kp, ns, klmn -> cpqrs', self.grad_coeff[iat, :, :, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.v_ao[:, :, :, :], optimize=True)
+    #        self.dv_mo[iat, :, :, :, :, :] += np.einsum('cns, lq, mr, kp, klmn -> cpqrs', self.grad_coeff[iat, :, :, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.mo_coeff[:, :], self.v_ao[:, :, :, :], optimize=True)
 
     ###################################
     # Exact factorization terms
