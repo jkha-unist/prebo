@@ -1,4 +1,4 @@
-from pyscf import gto, scf, mcscf, fci, nac, csf_fci, ao2mo, grad
+from pyscf import gto, scf, mcscf, fci, nac, csf_fci, ao2mo, grad, symm
 from pyscf.tools import mo_mapping, molden
 from functools import reduce
 import scipy
@@ -120,6 +120,7 @@ class pre_BO(object):
         during the sub-stepped electronic propagation.
         """
         self.vel_old = np.copy(self.vel)
+        self.mo_coeff_old = np.copy(self.mo_coeff)
         self.V_csf_old = np.copy(self.V_csf)
         self.D_csf_old = np.copy(self.D_csf)
         self.td_D_csf_old = np.copy(self.td_D_csf)
@@ -277,12 +278,17 @@ class pre_BO(object):
         for iat in range(self.nat):
             for isp in range(3):
                 self.D_csf[iat, isp, :, :] = self.mc.fcisolver.pspace(self.d_mo[iat, isp, self.ncore:self.ncore+self.no_cas, self.ncore:self.ncore+self.no_cas], zero_h2e, self.no_cas, self.ne_cas, npsp=self.ncsf)[1]
+        self.D_csf = 0.5 * (self.D_csf - self.D_csf.transpose(0, 1, 3, 2))
     
-    def get_td_D_csf(self, block_orth=True):
+    def get_td_D_csf(self, block_orth=True, finite_difference=False, dt=None):
         
         zero_h2e = np.zeros(self.v_cas.shape) # zero arrray to use `fcisolver.pspace`
-        k_mat, td_ao = self.get_td_mo_coeff(block_orth=block_orth)
-        cdot = self.mo_coeff @ k_mat
+        if (finite_difference):
+            _, td_ao = self.get_td_mo_coeff(block_orth=block_orth)
+            cdot = (self.mo_coeff - self.mo_coeff_old) / dt
+        else:
+            k_mat, td_ao = self.get_td_mo_coeff(block_orth=block_orth)
+            cdot = self.mo_coeff @ k_mat
         td_mo = np.einsum('kp, kl, lq', self.mo_coeff, td_ao, self.mo_coeff, optimize=True)
         td_mo += np.einsum('kp, kl, lq', self.mo_coeff, self.s_ao, cdot, optimize=True)
         td_mo = 0.5 * (td_mo - td_mo.transpose(1,0))
@@ -493,13 +499,16 @@ class pre_BO(object):
     def align_mo_coeff(self, mol_old, mo_old):
         
         mo = np.copy(self.mo_coeff)
+        if self.mol.symmetry:
+            mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
+        
         o_ao = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
         o = reduce(np.dot, (mo.T, o_ao, mo_old))
         m = o @ o.T
         m_vals, m_vecs = scipy.linalg.eigh(m)
         m_sqrt_inv = m_vecs @ np.diag(1.0 / np.sqrt(m_vals)) @ m_vecs.T
         u = m_sqrt_inv @ o
-        mo_new =  self.mo_coeff @ u
+        mo_new =  mo @ u
         self.mo_coeff = np.copy(mo_new)
         
     def get_grad_coeff(self): # For FCI..
@@ -519,6 +528,8 @@ class pre_BO(object):
         s_sqrt = s_vecs @ np.diag(sq_s) @ s_vecs.T
         s_inv = s_vecs @ np.diag(1.0 / s_vals) @ s_vecs.T
         c_local = s_vecs @ np.diag(1.0 / sq_s) @ s_vecs.T
+        if self.mol.symmetry:
+            c_local = symm.symmetrize_orb(self.mol, c_local, s=s)
         
         # 3. Inter-geometry overlap matrix: O = C_local^T * O_AO * C
         # O_AO = <chi(R(t)) | chi(R(t-dt))>
@@ -624,6 +635,8 @@ class pre_BO(object):
         overlap_mo = self.mo_coeff.T @ s @ self.mo_coeff
         val, vec = scipy.linalg.eigh(overlap_mo)
         self.mo_coeff = self.mo_coeff @ (vec @ np.diag(1.0/np.sqrt(val)) @ vec.T)
+        if self.mol.symmetry:
+            self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=s)
 
     def propagate_mo_coeff(self, dt, nsteps=100, block_orth=True):
         """
@@ -681,12 +694,16 @@ class pre_BO(object):
         overlap_mo = self.mo_coeff.T @ s @ self.mo_coeff
         val, vec = scipy.linalg.eigh(overlap_mo)
         self.mo_coeff = self.mo_coeff @ (vec @ np.diag(1.0/np.sqrt(val)) @ vec.T)
+        if self.mol.symmetry:
+            self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=s)
     
     def get_grad_coeff_continuous(self, block_orth=True):
         """
         Calculate MO coefficient gradients using the continuous connection matrix X^nu.
         X^nu is constructed to satisfy orthonormality and subspace preservation.
         """
+        if self.mol.symmetry:
+            self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=self.s_ao)
         self.get_grad_ao()
         ds_ao_raw = -self.mol.intor('int1e_ipovlp')
         
@@ -727,47 +744,55 @@ class pre_BO(object):
     def align_mo_coeff_spacewise(self, mol_old, mo_old, block_orth=True):
         
         mo = np.copy(self.mo_coeff)
-        
+        if self.mol.symmetry:
+            mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
         o0, o1 = self.ncore, self.ncore+self.no_cas
-        
         o_ao = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
         
+        # Core
         o_core = reduce(np.dot, (mo, o_ao, mo_old[:, :o0]))
-        m = o_core.T @ o_core
-        print(m)
-        m_vals, m_vecs = scipy.linalg.eigh(m)
-        m_sqrt_inv = m_vecs @ np.diag(1.0 / np.sqrt(m_vals)) @ m_vecs.T
-        u_core = o_core @ m_sqrt_inv
-        self.mat_core = [m_vals, m_vecs]
+        if o0 > 0:
+            m = o_core.T @ o_core
+            m_vals, m_vecs = scipy.linalg.eigh(m)
+            m_sqrt_inv = m_vecs @ np.diag(1.0 / np.sqrt(m_vals)) @ m_vecs.T
+            u_core = o_core @ m_sqrt_inv
+            self.mat_core = [m_vals, m_vecs]
+        else:
+            u_core = np.zeros((self.norb, 0))
+            self.mat_core = [np.array([]), np.array([])]
         
-        tmp = reduce(np.dot, (mo, o_ao, mo_old[:, o0:o1]))
-        o_act = np.copy(tmp)
+        # Active
+        tmp_act = reduce(np.dot, (mo, o_ao, mo_old[:, o0:o1]))
+        o_act = np.copy(tmp_act)
+        if block_orth and o0 > 0:
+            o_act -= u_core @ u_core.T @ tmp_act
         
-        if(block_orth):
-            o_act -= u_core @ u_core.T @ tmp
+        m_act = o_act.T @ o_act
+        m_vals_act, m_vecs_act = scipy.linalg.eigh(m_act)
+        m_sqrt_inv_act = m_vecs_act @ np.diag(1.0 / np.sqrt(m_vals_act)) @ m_vecs_act.T
+        u_act = o_act @ m_sqrt_inv_act
+        self.mat_act = [m_vals_act, m_vecs_act]
         
-        m = o_act.T @ o_act
-        m_vals, m_vecs = scipy.linalg.eigh(m)
-        m_sqrt_inv = m_vecs @ np.diag(1.0 / np.sqrt(m_vals)) @ m_vecs.T
-        u_act = o_act @ m_sqrt_inv
-        self.mat_act = [m_vals, m_vecs]
+        # Virtual
+        tmp_virt = reduce(np.dot, (mo, o_ao, mo_old[:, o1:]))
+        o_virt = np.copy(tmp_virt)
+        if block_orth:
+            if o0 > 0: o_virt -= u_core @ u_core.T @ tmp_virt
+            if self.no_cas > 0: o_virt -= u_act @ u_act.T @ tmp_virt
         
-        tmp = reduce(np.dot, (mo, o_ao, mo_old[:, o1:]))
-        o_virt = np.copy(tmp)
-        
-        if(block_orth):
-            o_virt -= u_core @ u_core.T @ tmp
-            o_virt -= u_act @ u_act.T @ tmp
-        
-        m = o_virt.T @ o_virt
-        m_vals, m_vecs = scipy.linalg.eigh(m)
-        m_sqrt_inv = m_vecs @ np.diag(1.0 / np.sqrt(m_vals)) @ m_vecs.T
-        u_virt = o_virt @ m_sqrt_inv
-        self.mat_virt = [m_vals, m_vecs]
+        if self.nvirt > 0:
+            m_virt = o_virt.T @ o_virt
+            m_vals_virt, m_vecs_virt = scipy.linalg.eigh(m_virt)
+            m_sqrt_inv_virt = m_vecs_virt @ np.diag(1.0 / np.sqrt(m_vals_virt)) @ m_vecs_virt.T
+            u_virt = o_virt @ m_sqrt_inv_virt
+            self.mat_virt = [m_vals_virt, m_vecs_virt]
+        else:
+            u_virt = np.zeros((self.norb, 0))
+            self.mat_virt = [np.array([]), np.array([])]
 
         self.u = np.column_stack((u_core, u_act, u_virt))
         
-        mo_new =  self.mo_coeff @ self.u
+        mo_new =  mo @ self.u
         self.mo_coeff = np.copy(mo_new)
 
     def get_grad_coeff_spacewise(self, block_orth=True):
@@ -789,6 +814,8 @@ class pre_BO(object):
         s_sqrt = s_vecs @ np.diag(sq_s) @ s_vecs.T
         s_inv = s_vecs @ np.diag(1.0 / s_vals) @ s_vecs.T
         c_local = s_vecs @ np.diag(1.0 / sq_s) @ s_vecs.T
+        if self.mol.symmetry:
+            c_local = symm.symmetrize_orb(self.mol, c_local, s=s)
         
         # 3. Inter-geometry overlap matrix: O = C_local^T * O_AO * C
         # O_AO = <chi(R(t)) | chi(R(t-dt))>
@@ -797,29 +824,28 @@ class pre_BO(object):
         o_mo = reduce(np.dot, (c_local, o_ao, self.mo_coeff_old))
         
         # 4. M = O * O^T
-        m_vals, m_vecs = self.mat_core[0], self.mat_core[1]
-        sq_m = np.sqrt(m_vals)
-        m_c_inv = m_vecs @ np.diag(1.0 / m_vals) @ m_vecs.T
-        m_c_sqrt = m_vecs @ np.diag(sq_m) @ m_vecs.T
-        m_c_sqrt_inv = m_vecs @ np.diag(1.0 / sq_m) @ m_vecs.T
+        if o0 > 0:
+            m_vals, m_vecs = self.mat_core[0], self.mat_core[1]
+            sq_m = np.sqrt(m_vals)
+            m_c_inv = m_vecs @ np.diag(1.0 / m_vals) @ m_vecs.T
+            m_c_sqrt_inv = m_vecs @ np.diag(1.0 / sq_m) @ m_vecs.T
         
         m_vals, m_vecs = self.mat_act[0], self.mat_act[1]
         sq_m = np.sqrt(m_vals)
         m_a_inv = m_vecs @ np.diag(1.0 / m_vals) @ m_vecs.T
-        m_a_sqrt = m_vecs @ np.diag(sq_m) @ m_vecs.T
         m_a_sqrt_inv = m_vecs @ np.diag(1.0 / sq_m) @ m_vecs.T
         
-        m_vals, m_vecs = self.mat_virt[0], self.mat_virt[1]
-        sq_m = np.sqrt(m_vals)
-        m_v_inv = m_vecs @ np.diag(1.0 / m_vals) @ m_vecs.T
-        m_v_sqrt = m_vecs @ np.diag(sq_m) @ m_vecs.T
-        m_v_sqrt_inv = m_vecs @ np.diag(1.0 / sq_m) @ m_vecs.T
+        if self.nvirt > 0:
+            m_vals, m_vecs = self.mat_virt[0], self.mat_virt[1]
+            sq_m = np.sqrt(m_vals)
+            m_v_inv = m_vecs @ np.diag(1.0 / m_vals) @ m_vecs.T
+            m_v_sqrt_inv = m_vecs @ np.diag(1.0 / sq_m) @ m_vecs.T
         
         u = np.copy(self.u)
         
         # 6. Precompute Gradient of O_AO:<nabla_nu chi(R(t)) | chi(R(t-dt))> & <chi(R(t)) | \nabla chi(R(t-dt))>
         do_ao_raw_left = -gto.intor_cross('int1e_ipovlp', self.mol, self.mol_old)
-        do_ao_raw_right = -gto.intor_cross('int1e_ipovlp', self.mol_old, self.mol).transpose(0, 2, 1)
+        #do_ao_raw_right = -gto.intor_cross('int1e_ipovlp', self.mol_old, self.mol).transpose(0, 2, 1)
 
         for iat in range(self.nat):
             shl0, shl1, p0, p1 = self.aoslices[iat]
@@ -832,31 +858,30 @@ class pre_BO(object):
             # nabla O_AO for this atom
             do_ao = np.zeros((3, self.norb, self.norb))
             do_ao[:, p0:p1, :] = do_ao_raw_left[:, p0:p1, :] 
-            #do_ao[:, :, p0:p1] += do_ao_raw_right[:, :, p0:p1]
             
             for idim in range(3):
-                
                 # Gradient of local MO coefficient, S^{-1/2}
                 rhs_s = - s_inv @ ds[idim] @ s_inv
                 dc_local = scipy.linalg.solve_sylvester(c_local, c_local, rhs_s)
                 # Gradient of local time overlap
-                do_mo = dc_local @ o_ao @ self.mo_coeff_old + c_local @ do_ao[idim] @ self.mo_coeff_old #+ c_local @ o_ao @ self.grad_coeff_old[iat, idim]
+                do_mo = dc_local @ o_ao @ self.mo_coeff_old + c_local @ do_ao[idim] @ self.mo_coeff_old
                 
                 # Core
-                dm_core = do_mo[:, :o0].T @ o_mo[:, :o0] + o_mo[:, :o0].T @ do_mo[:, :o0]
-                rhs_m = - m_c_inv @ dm_core @ m_c_inv
-                dm_sqrt_inv = scipy.linalg.solve_sylvester(m_c_sqrt_inv, m_c_sqrt_inv, rhs_m)
-                du_core = do_mo[:, :o0] @ m_c_sqrt_inv + o_mo[:, :o0] @ dm_sqrt_inv
-                self.grad_coeff[iat, idim, :, :o0] = dc_local @ u[:, :o0] + c_local @ du_core
+                if o0 > 0:
+                    dm_core = do_mo[:, :o0].T @ o_mo[:, :o0] + o_mo[:, :o0].T @ do_mo[:, :o0]
+                    rhs_m = - m_c_inv @ dm_core @ m_c_inv
+                    dm_sqrt_inv = scipy.linalg.solve_sylvester(m_c_sqrt_inv, m_c_sqrt_inv, rhs_m)
+                    du_core = do_mo[:, :o0] @ m_c_sqrt_inv + o_mo[:, :o0] @ dm_sqrt_inv
+                    self.grad_coeff[iat, idim, :, :o0] = dc_local @ u[:, :o0] + c_local @ du_core
+                else:
+                    du_core = np.zeros((self.norb, 0))
 
                 # Active
                 o_act = o_mo[:, o0:o1] 
                 do_act = np.copy(do_mo[:, o0:o1])
                 
-                if(block_orth):
-                    
+                if(block_orth and o0 > 0):
                     o_act -= u[:, :o0] @ u[:, :o0].T @ o_mo[:, o0:o1]
-
                     do_act -= du_core @ u[:, :o0].T @ o_mo[:, o0:o1]
                     do_act -= u[:, :o0] @ du_core.T @ o_mo[:, o0:o1]
                     do_act -= u[:, :o0] @ u[:, :o0].T @ do_mo[:, o0:o1]
@@ -868,25 +893,27 @@ class pre_BO(object):
                 self.grad_coeff[iat, idim, :, o0:o1] = dc_local @ u[:, o0:o1] + c_local @ du_act
 
                 # Virtual
-                o_virt = o_mo[:, o1:] 
-                do_virt = np.copy(do_mo[:, o1:])
-                
-                if (block_orth):
+                if self.nvirt > 0:
+                    o_virt = o_mo[:, o1:] 
+                    do_virt = np.copy(do_mo[:, o1:])
                     
-                    o_virt -= u[:, :o0] @ u[:, :o0].T @ o_mo[:, o1:] + u[:, o0:o1] @ u[:, o0:o1].T @ o_mo[:, o1:]
+                    if (block_orth):
+                        if o0 > 0:
+                            o_virt -= u[:, :o0] @ u[:, :o0].T @ o_mo[:, o1:]
+                            do_virt -= du_core @ u[:, :o0].T @ o_mo[:, o1:]
+                            do_virt -= u[:, :o0] @ du_core.T @ o_mo[:, o1:]
+                            do_virt -= u[:, :o0] @ u[:, :o0].T @ do_mo[:, o1:]
+                        
+                        o_virt -= u[:, o0:o1] @ u[:, o0:o1].T @ o_mo[:, o1:]
+                        do_virt -= du_act @ u[:, o0:o1].T @ o_mo[:, o1:]
+                        do_virt -= u[:, o0:o1] @ du_act.T @ o_mo[:, o1:]
+                        do_virt -= u[:, o0:o1] @ u[:, o0:o1].T @ do_mo[:, o1:]
                     
-                    do_virt -= du_core @ u[:, :o0].T @ o_mo[:, o1:]
-                    do_virt -= u[:, :o0] @ du_core.T @ o_mo[:, o1:]
-                    do_virt -= u[:, :o0] @ u[:, :o0].T @ do_mo[:, o1:]
-                    do_virt -= du_act @ u[:, o0:o1].T @ o_mo[:, o1:]
-                    do_virt -= u[:, o0:o1] @ du_act.T @ o_mo[:, o1:]
-                    do_virt -= u[:, o0:o1] @ u[:, o0:o1].T @ do_mo[:, o1:]
-                
-                dm_virt = do_virt.T @ o_virt + o_virt.T @ do_virt
-                rhs_m = - m_v_inv @ dm_virt @ m_v_inv
-                dm_sqrt_inv = scipy.linalg.solve_sylvester(m_v_sqrt_inv, m_v_sqrt_inv, rhs_m)
-                du_virt = do_virt @ m_v_sqrt_inv + o_virt @ dm_sqrt_inv
-                self.grad_coeff[iat, idim, :, o1:] = dc_local @ u[:, o1:] + c_local @ du_virt
+                    dm_virt = do_virt.T @ o_virt + o_virt.T @ do_virt
+                    rhs_m = - m_v_inv @ dm_virt @ m_v_inv
+                    dm_sqrt_inv = scipy.linalg.solve_sylvester(m_v_sqrt_inv, m_v_sqrt_inv, rhs_m)
+                    du_virt = do_virt @ m_v_sqrt_inv + o_virt @ dm_sqrt_inv
+                    self.grad_coeff[iat, idim, :, o1:] = dc_local @ u[:, o1:] + c_local @ du_virt
 
     ###################################
     # Exact factorization terms
