@@ -9,7 +9,7 @@ import time
 
 class pre_BO(object):
     
-    def __init__(self, mol, ne_cas, no_cas, nmo=None, spin=0):
+    def __init__(self, mol, ne_cas, no_cas, nmo=None, spin=0, ao_mask=None):
         
         # System
         self.mol = mol # molecule object of pyscf
@@ -20,24 +20,59 @@ class pre_BO(object):
         
         self.mol_old = mol.copy() # backup molecule
         
-        self.nao = mol.nao # number of total spatial orbitals
+        # AO Mask / Truncation
+        if ao_mask is None and mol.symmetry:
+            # Default to A1 (usually irrep 0 in Coov/C2v/D2h)
+            irrep_ids = symm.label_orb_symm(mol, mol.irrep_id, mol.symm_orb, np.eye(mol.nao))
+            self.ao_mask = (irrep_ids == 0)
+        else:
+            self.ao_mask = ao_mask
+
+        if self.ao_mask is not None:
+            self.trunc_idx = np.where(self.ao_mask)[0]
+            self.nao = len(self.trunc_idx)
+            
+            # Map full AOSlices to truncated AOSlices
+            full_slices = self.mol.aoslice_by_atom()
+            self.aoslices = []
+            current_trunc_idx = 0
+            for iat in range(self.nat):
+                p0, p1 = full_slices[iat][2:4]
+                # Count how many AOs in this atom are kept
+                num_kept = np.sum(self.ao_mask[p0:p1])
+                self.aoslices.append((full_slices[iat][0], full_slices[iat][1], current_trunc_idx, current_trunc_idx + num_kept))
+                current_trunc_idx += num_kept
+        else:
+            self.nao = mol.nao
+            self.aoslices = self.mol.aoslice_by_atom()
+            self.trunc_idx = np.arange(self.nao)
+
         if (nmo == None):
             self.nmo = self.nao
         else:
             self.nmo = nmo
+            
         self.ne_cas = ne_cas # number of active alpha and beta electrons. tuple (alpha, beta)
         self.no_cas = no_cas # number of active spatial orbitals
         self.spin = spin # S
-        self.aoslices = self.mol.aoslice_by_atom() 
         
-        # AO integrals
-        self.s_ao = self.mol.intor('int1e_ovlp') # AO overlap (nao, nao)
-        self.kin_ao = self.mol.intor('int1e_kin') # AO 1e kinetic energy integral
-        self.nuc_ao = self.mol.intor('int1e_nuc') # AO 1e e-n couloumb integral
-        self.v_ao = self.mol.intor('int2e', aosym='s1').transpose(0, 2, 1, 3) # AO 2e e-e coulomb integral
+        # AO integrals (sliced)
+        s_full = self.mol.intor('int1e_ovlp')
+        self.s_ao = s_full[self.trunc_idx, :][:, self.trunc_idx]
         
-        # AO integral gradients
-        self.d_ao = self.mol.intor('int1e_ipovlp').transpose(0,2,1) # (3, nao, nao)  <\chi_l | \nabla_e \chi_m> --> need to convert to d/dR_nuc which requires ao_slice for indices
+        kin_full = self.mol.intor('int1e_kin')
+        self.kin_ao = kin_full[self.trunc_idx, :][:, self.trunc_idx]
+        
+        nuc_full = self.mol.intor('int1e_nuc')
+        self.nuc_ao = nuc_full[self.trunc_idx, :][:, self.trunc_idx]
+        
+        v_full = self.mol.intor('int2e', aosym='s1').transpose(0, 2, 1, 3)
+        self.v_ao = v_full[self.trunc_idx, :, :, :][:, self.trunc_idx, :, :][:, :, self.trunc_idx, :][:, :, :, self.trunc_idx]
+        
+        # AO integral gradients (sliced)
+        d_full = self.mol.intor('int1e_ipovlp').transpose(0,2,1)
+        self.d_ao = d_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
+        
         self.dkin_ao = np.zeros((3, self.nao, self.nao)) # gradient of AO 1e integral (3, nao, nao)
         self.dnuc_ao = np.zeros((3, self.nao, self.nao)) # gradient of AO 1e integral (3, nao, nao)
         self.dv_ao = np.zeros((3, self.nao, self.nao, self.nao, self.nao)) # gradient of AO 2e integral (3, nao, nao, nao, nao)
@@ -132,7 +167,8 @@ class pre_BO(object):
 
     def get_td_mo_coeff(self, block_orth=True):
         
-        ds_ao_raw = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw_full = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw = ds_ao_raw_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
         ds_dt = np.zeros((self.nao, self.nao))
         td_ao = np.zeros((self.nao, self.nao))
         
@@ -162,19 +198,30 @@ class pre_BO(object):
     
 
     def get_int_ao(self):
+        s_full = self.mol.intor('int1e_ovlp')
+        self.s_ao = s_full[self.trunc_idx, :][:, self.trunc_idx]
 
-        self.s_ao = self.mol.intor('int1e_ovlp') # AO overlap (nao, nao)
-        self.kin_ao = self.mol.intor('int1e_kin') # AO 1e kinetic energy integral
-        self.nuc_ao = self.mol.intor('int1e_nuc') # AO 1e e-n couloumb integral
-        self.v_ao = self.mol.intor('int2e', aosym='s1').transpose(0, 2, 1, 3) # AO 2e e-e coulomb integral
-        self.d_ao = self.mol.intor('int1e_ipovlp').transpose(0,2,1) # (3, nao, nao)  <\chi_l | \nabla_e \chi_m> --> need to convert to d/dR_nuc which requires ao_slice for indices
-    
+        kin_full = self.mol.intor('int1e_kin')
+        self.kin_ao = kin_full[self.trunc_idx, :][:, self.trunc_idx]
+
+        nuc_full = self.mol.intor('int1e_nuc')
+        self.nuc_ao = nuc_full[self.trunc_idx, :][:, self.trunc_idx]
+
+        v_full = self.mol.intor('int2e', aosym='s1').transpose(0, 2, 1, 3)
+        self.v_ao = v_full[self.trunc_idx, :, :, :][:, self.trunc_idx, :, :][:, :, self.trunc_idx, :][:, :, :, self.trunc_idx]
+
+        d_full = self.mol.intor('int1e_ipovlp').transpose(0,2,1)
+        self.d_ao = d_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
+
     def get_grad_ao(self):
-        
-        self.dkin_ao = self.mol.intor('int1e_ipkin')
-        self.dnuc_ao = self.mol.intor('int1e_ipnuc')
-        self.dv_ao = self.mol.intor('int2e_ip1').transpose(0, 1, 3, 2, 4)
-    
+        dkin_full = self.mol.intor('int1e_ipkin')
+        self.dkin_ao = dkin_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
+
+        dnuc_full = self.mol.intor('int1e_ipnuc')
+        self.dnuc_ao = dnuc_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
+
+        dv_full = self.mol.intor('int2e_ip1').transpose(0, 1, 3, 2, 4)
+        self.dv_ao = dv_full[:, self.trunc_idx, :, :, :][:, :, self.trunc_idx, :, :][:, :, :, self.trunc_idx, :][:, :, :, :, self.trunc_idx]
     def get_int_mo(self):
         
         #C = self.mo_coeff
@@ -233,16 +280,35 @@ class pre_BO(object):
 
     def get_V_csf(self):
         
-        # TODO: make our own version of get_h1cas/_h2cas to use self.h_ao and self_v_ao, mc.get_h1cas/_h2cas calculates AO integrals again..
         self.mc.mo_coeff = np.copy(self.mo_coeff)
         self.mc.mol = self.mol.copy()
-        self.V_nuc = self.mol.enuc
-        self.h_cas, self.V_core = self.mc.get_h1cas(self.mo_coeff) # get active 1e integral and core energy + Vnn
-        self.v_cas = self.mc.get_h2cas(self.mo_coeff) # get active 2e integral
+        
+        o0 = self.ncore
+        o1 = self.ncore + self.no_cas
+        
+        # 1e
+        # h_{pq}
+        self.h_cas  = np.einsum('kp,kl,lq -> pq', self.mo_coeff[:, o0:o1], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, o0:o1], optimize=True)
+        # \sum_a 2(v_{paqa}-v_{pqaa})
+        self.h_cas += 2.0 * np.einsum('kp, la, mq, na, klmn -> pq', self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+        self.h_cas -= np.einsum('kp, lq, ma, na, klmn -> pq', self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+        
+        # 2e
+        # v_{pqrs}
+        self.v_cas = np.einsum('kp, lq, mr, ns, klmn -> pqrs', self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.mo_coeff[:, o0:o1], self.v_ao[:, :, :, :], optimize=True)
+        #self.v_cas = ao2mo.restore('4', self.v_cas.transpose(0,2,1,3), self.no_cas)
+        self.v_cas = self.v_cas.transpose(0,2,1,3)
+
         self.V_csf = self.mc.fcisolver.pspace(self.h_cas, self.v_cas, self.no_cas, self.ne_cas, npsp=self.ncsf)[1] # get CSF Hamiltonian matrix
-        #print(self.h_cas)
-        #print(self.V_core)
-        #print(self.v_cas)
+        
+        # V_{const}
+        # V_{nn}
+        self.V_core = self.mc.energy_nuc()
+        # \sum_a 2h_{aa}
+        self.V_core += 2.0 * np.einsum('ka,kl,la -> ', self.mo_coeff[:, :o0], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, :o0], optimize=True)
+        # \sum_{ab} 2(v_{abab}-v_{aabb})
+        self.V_core += 2.0 * np.einsum('ka, lb, ma, nb, klmn -> ', self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
+        self.V_core -= np.einsum('ka, la, mb, nb, klmn -> ', self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.mo_coeff[:, :o0], self.v_ao[:, :, :, :], optimize=True)
     
     def get_V_csf_2(self):
         
@@ -335,7 +401,8 @@ class pre_BO(object):
             dh_tmp += np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[p0:p1, o0:o1], -(self.dkin_ao+self.dnuc_ao)[:, p0:p1, :], self.mo_coeff[:, o0:o1], optimize=True)
             # AO < |\nabla V_nuc | > terms: \delta
             with self.mol.with_rinv_at_nucleus(iat):
-                drinv_tmp = self.mol.intor('int1e_iprinv', comp=3)
+                drinv_tmp_full = self.mol.intor('int1e_iprinv', comp=3)
+                drinv_tmp = drinv_tmp_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
                 drinv_tmp *= -self.mol.atom_charge(iat)
             dh_tmp += np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[:, o0:o1], drinv_tmp[:, :, :], self.mo_coeff[:, o0:o1], optimize=True)
             # effective 1e from 2e: \sum_a 2*((\kappa + \lambda)_{paqa}+(\kappa + \lambda)_{apaq}), due to symmetry summing transpose is same as multiplying 2 to (paqa+apaq)
@@ -370,6 +437,7 @@ class pre_BO(object):
             # effective const from 1e: 2*(\alpha_{aa} + \beta_{aa} + \delta_{aa}), due to symmetry summing transpose is same as multiplying 2
             self.dV_core[iat, :] += 4.0 * np.einsum('cka,kl,la -> c', self.grad_coeff[iat, :, :, :o0], (self.kin_ao+self.nuc_ao)[:, :], self.mo_coeff[:, :o0], optimize=True)
             self.dV_core[iat, :] += 4.0 * np.einsum('ka, ckl, la -> c', self.mo_coeff[p0:p1, :o0], -(self.dkin_ao+self.dnuc_ao)[:, p0:p1, :], self.mo_coeff[:, :o0], optimize=True)
+            # drinv_tmp is already sliced in the 1e section of this loop
             self.dV_core[iat, :] += 4.0 * np.einsum('ka, ckl, la -> c', self.mo_coeff[:, :o0], drinv_tmp[:, :, :], self.mo_coeff[:, :o0], optimize=True)
 
             # effective const from 2e: \kappa + \lambda, due to symmetry, summing transpose is same as multiplying 4
@@ -405,7 +473,8 @@ class pre_BO(object):
         for iat in range(self.nat):
             shl0, shl1, p0, p1 = self.aoslices[iat]
             with self.mol.with_rinv_at_nucleus(iat):
-                drinv_tmp = self.mol.intor('int1e_iprinv', comp=3)
+                drinv_tmp_full = self.mol.intor('int1e_iprinv', comp=3)
+                drinv_tmp = drinv_tmp_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
                 drinv_tmp *= -self.mol.atom_charge(iat)
             dh_tmp = np.einsum('kp, ckl, lq -> cpq', self.mo_coeff[:, o0:o1], drinv_tmp[:, :, :], self.mo_coeff[:, o0:o1], optimize=True)
             dh_mo = dh_tmp + dh_tmp.transpose(0, 2, 1)
@@ -503,10 +572,12 @@ class pre_BO(object):
     def align_mo_coeff(self, mol_old, mo_old):
         
         mo = np.copy(self.mo_coeff)
-        if self.mol.symmetry:
-            mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
+        # Symmetrization is skipped because truncated basis is already A1
+        # if self.mol.symmetry:
+        #     mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
         
-        o_ao = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
+        o_ao_full = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
+        o_ao = o_ao_full[self.trunc_idx, :][:, self.trunc_idx]
         o = reduce(np.dot, (mo.T, o_ao, mo_old))
         m = o @ o.T
         m_vals, m_vecs = scipy.linalg.eigh(m)
@@ -525,7 +596,8 @@ class pre_BO(object):
 
         # ds_ao_raw[c, mu, nu] = <nabla_c mu | nu>
         # Nuclear gradient d/dR_A = -nabla_e for basis functions on A.
-        ds_ao_raw = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw_full = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw = ds_ao_raw_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
         
         # 2. Local Lowdin Orbitals: C_local = S^-1/2 
         s_vals, s_vecs = scipy.linalg.eigh(s)
@@ -533,16 +605,15 @@ class pre_BO(object):
         s_sqrt = s_vecs @ np.diag(sq_s) @ s_vecs.T
         s_inv = s_vecs @ np.diag(1.0 / s_vals) @ s_vecs.T
         c_local = s_vecs @ np.diag(1.0 / sq_s) @ s_vecs.T
-        if self.mol.symmetry:
-            c_local = symm.symmetrize_orb(self.mol, c_local, s=s)
-            #irrep_ids = symm.label_orb_symm(self.mol, self.mol.irrep_id, self.mol.symm_orb, c_local)
-            #c_local = c_local[:, irrep_ids==0]
-            #print(c_local.shape)
+        # if self.mol.symmetry:
+        #     c_local = symm.symmetrize_orb(self.mol, c_local, s=s)
             
         
         # 3. Inter-geometry overlap matrix: O = C_local^T * O_AO * C
         # O_AO = <chi(R(t)) | chi(R(t-dt))>
-        o_ao = gto.intor_cross('int1e_ovlp', self.mol, self.mol_old)
+        o_ao_full = gto.intor_cross('int1e_ovlp', self.mol, self.mol_old)
+        o_ao = o_ao_full[self.trunc_idx, :][:, self.trunc_idx]
+
         # C_local is symmetric, so C_local^T = C_local
         o = reduce(np.dot, (c_local.T, o_ao, self.mo_coeff_old))
         
@@ -558,9 +629,9 @@ class pre_BO(object):
         u = m_sqrt_inv @ o
 
         # 6. Precompute Gradient of O_AO:<nabla_nu chi(R(t)) | chi(R(t-dt))> & <chi(R(t)) | \nabla chi(R(t-dt))>
-        do_ao_raw_left = -gto.intor_cross('int1e_ipovlp', self.mol, self.mol_old)
-        #do_ao_raw_right = -gto.intor_cross('int1e_ipovlp', self.mol_old, self.mol).transpose(0, 2, 1)
-            
+        do_ao_raw_left_full = -gto.intor_cross('int1e_ipovlp', self.mol, self.mol_old)
+        do_ao_raw_left = do_ao_raw_left_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
+
         orthnorm_test = np.zeros((self.nat, 3))
 
         for iat in range(self.nat):
@@ -640,12 +711,11 @@ class pre_BO(object):
         self.mo_coeff = self.mo_coeff @ u_mo
         
         # Re-orthogonalize to prevent numerical drift
-        s = self.mol.intor('int1e_ovlp')
-        overlap_mo = self.mo_coeff.T @ s @ self.mo_coeff
+        overlap_mo = self.mo_coeff.T @ self.s_ao @ self.mo_coeff
         val, vec = scipy.linalg.eigh(overlap_mo)
         self.mo_coeff = self.mo_coeff @ (vec @ np.diag(1.0/np.sqrt(val)) @ vec.T)
-        if self.mol.symmetry:
-            self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=s)
+        # if self.mol.symmetry:
+        #     self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=self.s_ao)
 
     def propagate_mo_coeff(self, dt, nsteps=100, block_orth=True):
         """
@@ -699,22 +769,22 @@ class pre_BO(object):
             
         self.mo_coeff = C
         # Re-orthogonalize to prevent numerical drift
-        s = self.mol.intor('int1e_ovlp')
-        overlap_mo = self.mo_coeff.T @ s @ self.mo_coeff
+        overlap_mo = self.mo_coeff.T @ self.s_ao @ self.mo_coeff
         val, vec = scipy.linalg.eigh(overlap_mo)
         self.mo_coeff = self.mo_coeff @ (vec @ np.diag(1.0/np.sqrt(val)) @ vec.T)
-        if self.mol.symmetry:
-            self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=s)
+        # if self.mol.symmetry:
+        #     self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=self.s_ao)
     
     def get_grad_coeff_continuous(self, block_orth=True):
         """
         Calculate MO coefficient gradients using the continuous connection matrix X^nu.
         X^nu is constructed to satisfy orthonormality and subspace preservation.
         """
-        if self.mol.symmetry:
-            self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=self.s_ao)
+        # if self.mol.symmetry:
+        #     self.mo_coeff = symm.symmetrize_orb(self.mol, self.mo_coeff, s=self.s_ao)
         self.get_grad_ao()
-        ds_ao_raw = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw_full = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw = ds_ao_raw_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
         
         o0, o1 = self.ncore, self.ncore + self.no_cas
         
@@ -753,12 +823,12 @@ class pre_BO(object):
     def align_mo_coeff_spacewise(self, mol_old, mo_old, block_orth=True):
         
         mo = np.copy(self.mo_coeff)
-        if self.mol.symmetry:
-            mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
+        # if self.mol.symmetry:
+        #     mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
         o0, o1 = self.ncore, self.ncore+self.no_cas
-        o_ao = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
+        o_ao_full = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
+        o_ao = o_ao_full[self.trunc_idx, :][:, self.trunc_idx]
         
-        # There were bugs in calculating o_core, tmp_act, tmp_virt !!!!!!!!!!!!!!
         # Core
         o_core = reduce(np.dot, (mo.T, o_ao, mo_old[:, :o0]))
         if o0 > 0:
@@ -768,7 +838,7 @@ class pre_BO(object):
             u_core = o_core @ m_sqrt_inv
             self.mat_core = [m_vals, m_vecs]
         else:
-            u_core = np.zeros((self.nao, 0))
+            u_core = np.zeros((self.nmo, 0))
             self.mat_core = [np.array([]), np.array([])]
         
         # Active
@@ -797,7 +867,7 @@ class pre_BO(object):
             u_virt = o_virt @ m_sqrt_inv_virt
             self.mat_virt = [m_vals_virt, m_vecs_virt]
         else:
-            u_virt = np.zeros((self.nao, 0))
+            u_virt = np.zeros((self.nmo, 0))
             self.mat_virt = [np.array([]), np.array([])]
 
         self.u = np.column_stack((u_core, u_act, u_virt))
@@ -816,7 +886,8 @@ class pre_BO(object):
         s = np.copy(self.s_ao)
         # ds_ao_raw[c, mu, nu] = <nabla_c mu | nu>
         # Nuclear gradient d/dR_A = -nabla_e for basis functions on A.
-        ds_ao_raw = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw_full = -self.mol.intor('int1e_ipovlp')
+        ds_ao_raw = ds_ao_raw_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
         
         # 2. Local Lowdin Orbitals: C_local = S^-1/2 
         s_vals, s_vecs = scipy.linalg.eigh(s)
@@ -824,15 +895,15 @@ class pre_BO(object):
         s_sqrt = s_vecs @ np.diag(sq_s) @ s_vecs.T
         s_inv = s_vecs @ np.diag(1.0 / s_vals) @ s_vecs.T
         c_local = s_vecs @ np.diag(1.0 / sq_s) @ s_vecs.T
-        if self.mol.symmetry:
-            c_local = symm.symmetrize_orb(self.mol, c_local, s=s)
-            self.mc
+        # if self.mol.symmetry:
+        #     c_local = symm.symmetrize_orb(self.mol, c_local, s=s)
         
         # 3. Inter-geometry overlap matrix: O = C_local^T * O_AO * C
         # O_AO = <chi(R(t)) | chi(R(t-dt))>
-        o_ao = gto.intor_cross('int1e_ovlp', self.mol, self.mol_old)
+        o_ao_full = gto.intor_cross('int1e_ovlp', self.mol, self.mol_old)
+        o_ao = o_ao_full[self.trunc_idx, :][:, self.trunc_idx]
         # C_local is symmetric, so C_local^T = C_local
-        o_mo = reduce(np.dot, (c_local.T, o_ao, self.mo_coeff_old))
+        o_mo = reduce(np.dot, (c_local, o_ao, self.mo_coeff_old))
         
         # 4. M = O * O^T
         if o0 > 0:
@@ -855,7 +926,8 @@ class pre_BO(object):
         u = np.copy(self.u)
         
         # 6. Precompute Gradient of O_AO:<nabla_nu chi(R(t)) | chi(R(t-dt))> & <chi(R(t)) | \nabla chi(R(t-dt))>
-        do_ao_raw_left = -gto.intor_cross('int1e_ipovlp', self.mol, self.mol_old)
+        do_ao_raw_left_full = -gto.intor_cross('int1e_ipovlp', self.mol, self.mol_old)
+        do_ao_raw_left = do_ao_raw_left_full[:, self.trunc_idx, :][:, :, self.trunc_idx]
         #do_ao_raw_right = -gto.intor_cross('int1e_ipovlp', self.mol_old, self.mol).transpose(0, 2, 1)
 
         for iat in range(self.nat):
