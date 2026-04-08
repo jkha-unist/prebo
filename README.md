@@ -1,6 +1,6 @@
-# Gemini: Pre-Born-Oppenheimer Direct Dynamics Simulation
+# prebo: Pre-Born-Oppenheimer Direct Dynamics Simulation
 
-Gemini is a pre-Born-Oppenheimer (pre-BO) direct dynamics simulation code for molecular systems. It performs nuclear dynamics on diabatic potential energy surfaces constructed from Configuration State Functions (CSFs) using [PySCF](https://pyscf.org/) as the electronic structure backend.
+`prebo` is a pre-Born-Oppenheimer (pre-BO) direct dynamics simulation code for molecular systems. It performs nuclear dynamics on diabatic potential energy surfaces constructed from Configuration State Functions (CSFs) using [PySCF](https://pyscf.org/) as the electronic structure backend.
 
 ## Overview
 
