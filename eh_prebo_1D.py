@@ -155,7 +155,7 @@ class Eh_PreBO_1D:
             def get_cdot(c_curr, t):
                 if self.l_tdnac:
                     M_t = M_old * (1 - t) + M_new * t
-                    return M_t @ c_curr - (k_mat @ np.abs(c_curr)**2) * c_curr
+                    return M_t @ c_curr 
                 else:
                     vt = v_old * (1-t) + v_new * t
                     dt = d_old * (1-t) + d_new * t
