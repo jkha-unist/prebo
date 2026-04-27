@@ -197,7 +197,7 @@ class CTv2_PreBO_1D:
                 if (self.t_pot == 0):
                     v_ii = self.calcs[itraj].V_csf[ist, ist]
                 elif (self.t_pot == 1):
-                    v_ii = np.sum(self.C[itraj, ist] * self.calcs[itraj].V_csf[ist, :] * self.C[itraj, :]).real / self.rho[itraj, ist]
+                    v_ii = np.sum(self.C[itraj, ist].conj() * self.calcs[itraj].V_csf[ist, :] * self.C[itraj, :]).real / self.rho[itraj, ist]
                 
                 v_ii += self.calcs[itraj].V_core
                 self.p_i[itraj, ist, 0] = np.sqrt(max(0, (etot - v_ii)/ekin)) * self.V[itraj, 0] * self.m_eff if ekin > small else 0.0
@@ -306,6 +306,7 @@ class CTv2_PreBO_1D:
             p_cl = self.V[itraj, 0] * self.m_eff
             for ist in range(self.nst): 
                 shift[ist] = 0.5 * inv_m * (self.dS[itraj, ist, 0] - p_cl)**2
+
         def get_cdot(c_curr, t):
             if self.l_tdnac:
                 M_t = M_old * (1 - t) + M_new * t
