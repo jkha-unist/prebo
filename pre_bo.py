@@ -500,13 +500,17 @@ class pre_BO(object):
     #####################################################################################################
     # MO alignment and corresponding gradient without separation of space, discrete
     #####################################################################################################
-    def align_mo_coeff(self, mol_old, mo_old, diag_block_0=False):
+    def align_mo_coeff(self, mol_old, mo_old, diag_block_0=False, local=False):
         
         mo = np.copy(self.mo_coeff)
         if self.mol.symmetry:
             mo = symm.symmetrize_orb(self.mol, mo, s=self.s_ao)
         
-        o_ao = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
+        if (local):
+            o_ao = np.copy(self.s_ao)
+        else:
+            o_ao = gto.intor_cross('int1e_ovlp', self.mol, mol_old)
+
         if (diag_block_0):
             for iat in range(self.nat):
                 p0, p1 = self.aoslices[iat][2:4]
@@ -523,7 +527,7 @@ class pre_BO(object):
         mo_new =  mo @ u
         self.mo_coeff = np.copy(mo_new)
         
-    def get_grad_coeff(self, diag_block_0=False): # For FCI..
+    def get_grad_coeff(self, diag_block_0=False, local=False): # For FCI..
         """
         Calculate analytical nuclear gradient of Tracked Lowdin Molecular Orbitals.
         Implements equations 15-21 from Pre_BO_direct_dynamics.pdf.
@@ -550,7 +554,10 @@ class pre_BO(object):
         
         # 3. Inter-geometry overlap matrix: O = C_local^T * O_AO * C
         # O_AO = <chi(R(t)) | chi(R(t-dt))>
-        o_ao = gto.intor_cross('int1e_ovlp', self.mol, self.mol_old)
+        if (local):
+            o_ao = np.copy(s)
+        else:
+            o_ao = gto.intor_cross('int1e_ovlp', self.mol, self.mol_old)
         if (diag_block_0):
             for iat in range(self.nat):
                 p0, p1 = self.aoslices[iat][2:4]
@@ -589,8 +596,11 @@ class pre_BO(object):
             #print(dns[:, p0:p1, p0:p1])
             
             # nabla O_AO for this atom
-            dno_ao = np.zeros((3, self.nao, self.nao))
-            dno_ao[:, p0:p1, :] = do_ao_raw_left[:, p0:p1, :] 
+            if (local):
+                dno_ao = np.copy(dns)
+            else:
+                dno_ao = np.zeros((3, self.nao, self.nao))
+                dno_ao[:, p0:p1, :] = do_ao_raw_left[:, p0:p1, :] 
             if (diag_block_0):
                 for io in range(p0, p1):
                     for jo in range(io+1, p1):

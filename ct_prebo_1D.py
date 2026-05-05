@@ -405,7 +405,7 @@ class CTv2_PreBO_1D:
                 self.rho[itraj] = np.abs(self.C[itraj])**2
                 ekin = 0.5 * self.m_eff * self.V[itraj, 0]**2
                 if (self.t_pot == 0 or self.t_pot == 1):
-                    epot = self.calcs[itraj].V_core + np.einsum('I, IJ, J', self.C[i].conj(), self.calcs[itraj].V_csf, self.C[i]).real
+                    epot = self.calcs[itraj].V_core + np.einsum('I, IJ, J', self.C[itraj].conj(), self.calcs[itraj].V_csf, self.C[itraj]).real
                 if (self.t_pot == 2):
                     epot = self.calcs[itraj].V_core + np.einsum('I, II', self.rho[itraj, :], self.calcs[itraj].V_csf[:, :])
                 self.etot0[itraj] = ekin + epot
