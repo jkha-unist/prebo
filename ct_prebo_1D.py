@@ -6,7 +6,7 @@ import os, time
             
 
 class CTv2_PreBO_1D:
-    def __init__(self, calculators, q, v, dt=10.0, nsteps=1000, nesteps=20, nst_fci=6, l_hff=False, l_tdnac=False, l_crunch=True, t_pc=1, t_cons=2, l_etot0=True, t_pot=0, rho_threshold=0.01):
+    def __init__(self, calculators, q, v, dt=10.0, nsteps=1000, nesteps=20, nst_fci=6, l_hff=False, l_tdnac=False, l_crunch=True, t_pc=1, t_cons=2, l_etot0=True, t_pot=0, l_csf_f_phase=False, l_ct_force=True, l_real_pop=False, rho_threshold=0.01):
         """
         Reduced CTv2 driver for 1D.
         Expects properties from pre_BO_1D (all scalars/NSTxNST matrices).
@@ -19,6 +19,9 @@ class CTv2_PreBO_1D:
         self.l_tdnac = l_tdnac
         self.l_crunch, self.t_pc, self.t_cons, self.rho_threshold = l_crunch, t_pc, t_cons, rho_threshold
         self.t_pot = t_pot
+        self.l_csf_f_phase = l_csf_f_phase
+        self.l_ct_force = l_ct_force
+        self.l_real_pop = l_real_pop
         self.nst_fci = nst_fci
         
         self.calcs = calculators
@@ -184,23 +187,32 @@ class CTv2_PreBO_1D:
         
         # Phase term calculation
         for itraj in range(self.ntrajs):
-            ekin = 0.5 * self.m_eff * self.V[itraj, 0]**2
-            if (self.l_etot0):
-                etot = self.etot0[itraj]
+            if (self.l_csf_f_phase):
+                for ist in range(self.nst):
+                    if not (self.l_coh[itraj, ist]): continue
+                    self.p_i[itraj, ist, 0] -= np.sum(self.C[itraj, ist].conj() * self.calcs[itraj].dV_csf[ist, :] * self.C[itraj, :]).real / self.rho[itraj, ist] * self.dt #- self.calcs[itraj].dV_core * self.dt
             else:
-                epot = self.calcs[itraj].V_core + np.einsum('I, IJ, J', self.C[itraj].conj(), self.calcs[itraj].V_csf, self.C[itraj]).real
-                etot = ekin + epot
+                ekin = 0.5 * self.m_eff * self.V[itraj, 0]**2
+                if (self.l_etot0):
+                    etot = self.etot0[itraj]
+                else:
+                    if (self.t_pot == 0 or self.t_pot == 1):
+                        epot = self.calcs[itraj].V_core + np.einsum('I, IJ, J', self.C[itraj].conj(), self.calcs[itraj].V_csf, self.C[itraj]).real
+                    if (self.t_pot == 2):
+                        epot = self.calcs[itraj].V_core + np.einsum('I, II', self.rho[itraj, :], self.calcs[itraj].V_csf[:, :])
+                    
+                    etot = ekin + epot
 
-            for ist in range(self.nst):
-                if not (self.l_coh[itraj, ist]): continue
-                
-                if (self.t_pot == 0):
-                    v_ii = self.calcs[itraj].V_csf[ist, ist]
-                elif (self.t_pot == 1):
-                    v_ii = np.sum(self.C[itraj, ist].conj() * self.calcs[itraj].V_csf[ist, :] * self.C[itraj, :]).real / self.rho[itraj, ist]
-                
-                v_ii += self.calcs[itraj].V_core
-                self.p_i[itraj, ist, 0] = np.sqrt(max(0, (etot - v_ii)/ekin)) * self.V[itraj, 0] * self.m_eff if ekin > small else 0.0
+                for ist in range(self.nst):
+                    if not (self.l_coh[itraj, ist]): continue
+                    
+                    if (self.t_pot == 0 or self.t_pot == 2):
+                        v_ii = self.calcs[itraj].V_csf[ist, ist]
+                    elif (self.t_pot == 1):
+                        v_ii = np.sum(self.C[itraj, ist].conj() * self.calcs[itraj].V_csf[ist, :] * self.C[itraj, :]).real / self.rho[itraj, ist]
+                    
+                    v_ii += self.calcs[itraj].V_core
+                    self.p_i[itraj, ist, 0] = np.sqrt(max(0, (etot - v_ii)/ekin)) * self.V[itraj, 0] * self.m_eff if ekin > small else 0.0
 
         # 1D Quantum Momenta
         for itraj in range(self.ntrajs):
@@ -208,11 +220,16 @@ class CTv2_PreBO_1D:
             for ist in range(self.nst):
                 if np.isinf(self.sigma[ist]): continue
                 if self.sigma[ist, 0] < small: continue
-                dist_sq = (self.R[itraj, 0] - self.avg_R[ist, 0])**2 / (2 * self.sigma[ist, 0]**2 + small)
-                g_val = np.exp(-dist_sq) * rho_avg[ist] / np.sqrt(2.0 * np.pi * self.sigma[ist, 0]**2)# N_i * |\chi_i| ^ 2
-                p_nu -= g_val * (self.R[itraj, 0] - self.avg_R[ist, 0]) / (self.sigma[ist, 0]**2 + small) # N_i * \nabla |\chi_i|^2
-                g_total += g_val # \sum_i N_i * \nabla|\chi_i|^2
-            self.qmom[itraj] = p_nu / g_total if g_total > small else 0.0
+                if (self.l_real_pop):
+                    p_nu -= self.rho[itraj, ist] * (self.R[itraj, 0] - self.avg_R[ist, 0]) / (self.sigma[ist, 0]**2 + small) # N_i * \nabla |\chi_i|^2
+                else:
+                    dist_sq = (self.R[itraj, 0] - self.avg_R[ist, 0])**2 / (2 * self.sigma[ist, 0]**2 + small)
+                    g_val = np.exp(-dist_sq) * rho_avg[ist] / np.sqrt(2.0 * np.pi * self.sigma[ist, 0]**2) # N_i * |\chi_i| ^ 2
+                    p_nu -= g_val * (self.R[itraj, 0] - self.avg_R[ist, 0]) / (self.sigma[ist, 0]**2 + small) # N_i * \nabla |\chi_i|^2
+                    g_total += g_val # \sum_i N_i * \nabla|\chi_i|^2
+            
+            if (not self.l_real_pop):
+                self.qmom[itraj] = p_nu / g_total if g_total > small else 0.0
 
             if self.l_crunch:
                 index_lk = 0
@@ -253,27 +270,26 @@ class CTv2_PreBO_1D:
                 for jst in range(ist + 1, self.nst):
                     p_j = self.p_i[itraj, jst, 0]
                     k_val = 0.5 * inv_m * p_nu * (p_i - p_j)
-                    #if self.t_cons == 2: k_val += 0.5 * inv_m * self.beta[index_lk, 0]
                     self.K[itraj, ist, jst] = k_val; self.K[itraj, jst, ist] = -k_val
                     if self.l_crunch:
                         k_bo_val = 0.5 * inv_m * self.qmom_bo[itraj, index_lk, 0] * (p_i - p_j)
-                        #if self.t_cons == 2: k_bo_val += 0.5 * inv_m * self.beta[index_lk, 0]
                         self.K_bo[itraj, ist, jst] = k_bo_val
                         self.K_bo[itraj, jst, ist] = -k_bo_val
                     index_lk += 1
 
         # Force (1D)
-        for itraj in range(self.ntrajs):
-            self.F_ct[itraj] = 0.0; index_lk = 0
-            for ist in range(self.nst):
-                p_i = self.p_i[itraj, ist, 0]
-                for jst in range(ist + 1, self.nst):
-                    p_j = self.p_i[itraj, jst, 0]
-                    k_eff = (self.K_bo[itraj, ist, jst] - self.K[itraj, ist, jst]) if self.l_crunch else self.K[itraj, ist, jst]
-                    self.F_ct[itraj] -= 2.0 * self.rho[itraj, ist] * self.rho[itraj, jst] * k_eff * (p_i - p_j)
-                    if self.t_cons == 2:
-                        self.F_ct[itraj] -= self.rho[itraj, ist] * self.rho[itraj, jst] * (inv_m * self.beta[index_lk, 0]) * (p_i - p_j)
-                    index_lk += 1
+        if (self.l_ct_force):
+            for itraj in range(self.ntrajs):
+                self.F_ct[itraj] = 0.0; index_lk = 0
+                for ist in range(self.nst):
+                    p_i = self.p_i[itraj, ist, 0]
+                    for jst in range(ist + 1, self.nst):
+                        p_j = self.p_i[itraj, jst, 0]
+                        k_eff = (self.K_bo[itraj, ist, jst] - self.K[itraj, ist, jst]) if self.l_crunch else self.K[itraj, ist, jst]
+                        self.F_ct[itraj] -= 2.0 * self.rho[itraj, ist] * self.rho[itraj, jst] * k_eff * (p_i - p_j)
+                        if self.t_cons == 2:
+                            self.F_ct[itraj] -= self.rho[itraj, ist] * self.rho[itraj, jst] * (inv_m * self.beta[index_lk, 0]) * (p_i - p_j)
+                        index_lk += 1
 
     def propagate_elec(self, itraj):
         calc = self.calcs[itraj]
@@ -388,7 +404,10 @@ class CTv2_PreBO_1D:
             for itraj in range(self.ntrajs):
                 self.rho[itraj] = np.abs(self.C[itraj])**2
                 ekin = 0.5 * self.m_eff * self.V[itraj, 0]**2
-                epot = self.calcs[itraj].V_core + np.einsum('I, IJ, J', self.C[i].conj(), self.calcs[itraj].V_csf, self.C[i]).real
+                if (self.t_pot == 0 or self.t_pot == 1):
+                    epot = self.calcs[itraj].V_core + np.einsum('I, IJ, J', self.C[i].conj(), self.calcs[itraj].V_csf, self.C[i]).real
+                if (self.t_pot == 2):
+                    epot = self.calcs[itraj].V_core + np.einsum('I, II', self.rho[itraj, :], self.calcs[itraj].V_csf[:, :])
                 self.etot0[itraj] = ekin + epot
 
         self.calculate_ct_terms()
